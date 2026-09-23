@@ -13,7 +13,6 @@ from data import (
     PERSONAL_SUBTYPES,
     LEVEL_LABELS,
     LOCATIONS,
-    RENTAL_DURATIONS,
     SPORT_LABELS,
 )
 
@@ -82,12 +81,33 @@ def kb_locations(locations: list[str] | None = None, prefix: str = "loc", back_t
     return b.as_markup()
 
 
-def kb_rental_duration() -> InlineKeyboardMarkup:
+def kb_options(options: dict, prefix: str, back_target: str) -> InlineKeyboardMarkup:
+    """Универсальная клавиатура вида {ключ: подпись} -> кнопки prefix:ключ."""
     b = InlineKeyboardBuilder()
-    for key, label in RENTAL_DURATIONS.items():
-        b.button(text=label, callback_data=f"dur:{key}")
-    b.button(text="◀️ Назад", callback_data="back:rental_location")
+    for key, label in options.items():
+        b.button(text=label, callback_data=f"{prefix}:{key}")
     b.adjust(1)
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_target))
+    return b.as_markup()
+
+
+def kb_rental_complexes(complexes: list[tuple[str, str]], back_target: str) -> InlineKeyboardMarkup:
+    """complexes: список (key, название) — например data.get_rental_complexes()."""
+    b = InlineKeyboardBuilder()
+    for key, name in complexes:
+        b.button(text=name, callback_data=f"rcx:{key}")
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_target))
+    return b.as_markup()
+
+
+def kb_courts(courts: list[tuple[str, str]], prefix: str, back_target: str) -> InlineKeyboardMarkup:
+    """courts: список (key, название корта). Используется и для тенниса, и для бадминтона."""
+    b = InlineKeyboardBuilder()
+    for key, name in courts:
+        b.button(text=name, callback_data=f"{prefix}:{key}")
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_target))
     return b.as_markup()
 
 

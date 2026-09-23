@@ -12,6 +12,7 @@ from data import (
     CATEGORY_LABELS,
     LOCATIONS,
     SPORT_LABELS,
+    LESSON_TYPE_LABELS,
     CONSENT_TEXT,
     normalize_phone,
     build_summary_text,
@@ -32,11 +33,27 @@ from data import (
     get_available_dates,
     format_date_label,
     get_time_slots_for_window,
-    get_rental_time_slots_for_date,
     get_bp_locations,
+    is_pickleball_location_coming_soon,
+    build_pickleball_coming_soon_text,
     get_equipment_list,
     get_hour_slots,
     get_court_price,
+    get_rental_complexes,
+    get_rental_courts,
+    get_rental_equipment,
+    is_rental_complex_coming_soon,
+    get_tennis_rental_hours,
+    get_tennis_rental_price,
+    build_rental_complex_info_text,
+    build_badminton_info_text,
+    BADMINTON_LOCATION_NAME,
+    BADMINTON_COURTS,
+    TENNIS_RENTAL_COMPLEXES,
+    PICKLEBALL_PERSONAL_SUBTYPES,
+    get_pickleball_lesson_packages,
+    get_pickleball_lesson_schedule,
+    build_pickleball_lesson_schedule_text,
 )
 from db import (
     get_or_create_client,
@@ -96,12 +113,23 @@ async def on_sport(call: CallbackQuery, state: FSMContext):
             f"{SPORT_LABELS['tennis']}\n\nВыберите, что вас интересует:",
             reply_markup=kb.kb_category(back_target="back:sport"),
         )
-    else:
-        locations = get_bp_locations(sport)
+    elif sport == "badminton":
+        # Одно здание, доступное от 3 станций метро — но теперь тоже
+        # показываем шаг "выбор локации" (там будет одна кнопка), а не
+        # сразу прыгаем к выбору корта — для единообразия с остальными видами спорта.
         await state.set_state(Flow.bp_location)
         await call.message.edit_text(
-            f"{SPORT_LABELS[sport]}\n\nВыберите удобную локацию:",
-            reply_markup=kb.kb_locations(locations=locations, prefix="bploc", back_target="back:sport"),
+            f"{SPORT_LABELS['badminton']}\n\nВыберите удобную локацию:",
+            reply_markup=kb.kb_locations(locations=[BADMINTON_LOCATION_NAME], prefix="bploc", back_target="back:sport"),
+        )
+    else:  # pickleball
+        # Сценарий пиклбол-занятий полностью зеркалит теннисные школы:
+        # категория (детская/взрослая/аренда) -> тип занятий -> уровень ->
+        # локация -> тариф -> ... (см. Flow.pb_category и далее).
+        await state.set_state(Flow.pb_category)
+        await call.message.edit_text(
+            f"{SPORT_LABELS['pickleball']}\n\nВыберите, что вас интересует:",
+            reply_markup=kb.kb_category(back_target="back:sport"),
         )
     await call.answer()
 
@@ -124,8 +152,8 @@ async def on_category(call: CallbackQuery, state: FSMContext):
     if category == "rent":
         await state.set_state(Flow.rental_location)
         await call.message.edit_text(
-            "🏟 <b>Аренда корта</b>\n\nВыберите удобную локацию:",
-            reply_markup=kb.kb_locations(prefix="rloc", back_target="back:category"),
+            "🏟 <b>Аренда корта</b>\n\nВыберите комплекс:",
+            reply_markup=kb.kb_rental_complexes(get_rental_complexes(), back_target="back:category"),
         )
     else:
         await state.set_state(Flow.lesson_type)
@@ -375,7 +403,9 @@ async def on_package(call: CallbackQuery, state: FSMContext):
 
 
 async def _current_packages(data: dict):
-    """Восстанавливает список пакетов текущего шага (персональные или групповой оффер)."""
+    """Восстанавливает список пакетов текущего шага (персональные, групповой оффер тенниса, или занятия пиклбола)."""
+    if data.get("pb_mode") == "lesson":
+        return get_pickleball_lesson_packages(data.get("lesson_type"), data.get("subtype"))
     if data.get("lesson_type") == "personal":
         return get_personal_packages(data["location"], data["subtype"])
     offers = get_group_offers(data["location"], data["category"])
@@ -386,7 +416,11 @@ async def _current_packages(data: dict):
 @router.callback_query(F.data == "back:package")
 async def back_to_package(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if data.get("lesson_type") == "personal":
+    if data.get("pb_mode") == "lesson":
+        packages = get_pickleball_lesson_packages(data.get("lesson_type"), data.get("subtype"))
+        info_text = build_pickleball_lesson_schedule_text(data["lesson_type"], data["category"])
+        await show_package_step(call, state, packages, info_text=info_text, back_target="back:pb_lesson_location")
+    elif data.get("lesson_type") == "personal":
         packages = get_personal_packages(data["location"], data["subtype"])
         sched = get_personal_schedule(data["location"])
         if packages:
@@ -432,7 +466,9 @@ async def on_date(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back:date")
 async def back_to_date(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if data.get("lesson_type") == "personal":
+    if data.get("pb_mode") == "lesson":
+        back_target = "back:package"
+    elif data.get("lesson_type") == "personal":
         packages = get_personal_packages(data["location"], data["subtype"])
         back_target = "back:package" if packages else "back:location"
     else:
@@ -506,16 +542,32 @@ async def _resend_contact_prompt(message: Message, state: FSMContext):
     )
 
 
+def _equipment_back_target(sport: str) -> str:
+    """Куда ведёт «Назад» с экрана инвентаря: у бадминтона нет отдельного
+    шага выбора локации (одно здание) — там сразу возвращаемся к выбору корта."""
+    return "back:bp_court" if sport == "badminton" else "back:bp_location"
+
+
 async def _back_from_contact(message: Message, state: FSMContext):
     """
     Возврат с шага контакта на предыдущий (инлайн) экран — тариф/локация
-    для школ, длительность для аренды тенниса, или инвентарь для
-    бадминтона/пиклбола. Рендерится новым сообщением, так как обычная
-    (не инлайн) клавиатура уже была показана.
+    для школ и занятий пиклбола, инвентарь для аренды тенниса/бадминтона/
+    пиклбола. Рендерится новым сообщением, так как обычная (не инлайн)
+    клавиатура уже была показана.
     """
     await message.answer("Хорошо, возвращаемся назад.", reply_markup=ReplyKeyboardRemove())
     data = await state.get_data()
     sport = data.get("sport", "tennis")
+
+    if data.get("pb_mode") == "lesson":
+        packages = get_pickleball_lesson_packages(data.get("lesson_type"), data.get("subtype"))
+        info_text = build_pickleball_lesson_schedule_text(data["lesson_type"], data["category"])
+        await state.set_state(Flow.package)
+        await message.answer(
+            info_text,
+            reply_markup=kb.kb_packages(packages, prefix="pkg", back_target="back:pb_lesson_location"),
+        )
+        return
 
     if sport in ("badminton", "pickleball"):
         equipment_list = get_equipment_list(sport)
@@ -523,15 +575,17 @@ async def _back_from_contact(message: Message, state: FSMContext):
         await state.set_state(Flow.equipment)
         await message.answer(
             EQUIPMENT_PROMPT_TEXT,
-            reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:bp_location"),
+            reply_markup=kb.kb_equipment(equipment_list, selected, back_target=_equipment_back_target(sport)),
         )
         return
 
     if data.get("category") == "rent":
-        await state.set_state(Flow.rental_duration)
+        equipment_list = get_rental_equipment(data["rental_complex"])
+        selected = set(data.get("equipment_keys", []))
+        await state.set_state(Flow.rental_equipment)
         await message.answer(
-            "На какое время хотите арендовать корт?",
-            reply_markup=kb.kb_rental_duration(),
+            EQUIPMENT_PROMPT_TEXT,
+            reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:rental_court"),
         )
         return
 
@@ -634,10 +688,10 @@ async def on_consent_accept(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text("Спасибо! Продолжаем запись.")
 
     sport = data.get("sport", "tennis")
-    if sport in ("badminton", "pickleball"):
+    if sport in ("badminton", "pickleball") and data.get("pb_mode") != "lesson":
         await show_bp_date_step(call, state, back_target="back:equipment")
     elif data.get("category") == "rent":
-        await show_rental_date_step(call, state, back_target="back:rental_duration")
+        await show_rental_date_step(call, state, back_target="back:rental_equipment")
     else:
         packages = await _current_packages(data)
         back_target = "back:package" if packages else "back:location"
@@ -653,17 +707,29 @@ async def on_consent_back(call: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Ветка аренды корта: локация -> длительность -> дата -> время -> оплата
+# Ветка аренды корта (теннис): комплекс -> корт -> инвентарь -> (контакт/имя/
+# согласие, обработчики уже выше) -> дата -> время (цена своя для каждого
+# часа и корта) -> оплата
 # ---------------------------------------------------------------------------
-@router.callback_query(Flow.rental_location, F.data.startswith("rloc:"))
-async def on_rental_location(call: CallbackQuery, state: FSMContext):
-    idx = int(call.data.split(":", 1)[1])
-    location = LOCATIONS[idx]
-    await state.update_data(rental_location=location)
-    await state.set_state(Flow.rental_duration)
+@router.callback_query(Flow.rental_location, F.data.startswith("rcx:"))
+async def on_rental_complex(call: CallbackQuery, state: FSMContext):
+    complex_key = call.data.split(":", 1)[1]
+    await state.update_data(rental_complex=complex_key)
+
+    if is_rental_complex_coming_soon(complex_key):
+        # Комплекс ещё не открыт — показываем инфо и просто кнопку "Назад",
+        # без перехода к выбору корта (бронирование пока недоступно).
+        await call.message.edit_text(
+            build_rental_complex_info_text(complex_key),
+            reply_markup=kb.kb_options({}, prefix="noop", back_target="back:rental_location"),
+        )
+        await call.answer()
+        return
+
+    await state.set_state(Flow.rental_court)
     await call.message.edit_text(
-        "На какое время хотите арендовать корт?",
-        reply_markup=kb.kb_rental_duration(),
+        build_rental_complex_info_text(complex_key),
+        reply_markup=kb.kb_courts(get_rental_courts(complex_key), prefix="rcourt", back_target="back:rental_location"),
     )
     await call.answer()
 
@@ -672,26 +738,80 @@ async def on_rental_location(call: CallbackQuery, state: FSMContext):
 async def back_to_rental_location(call: CallbackQuery, state: FSMContext):
     await state.set_state(Flow.rental_location)
     await call.message.edit_text(
-        "🏟 <b>Аренда корта</b>\n\nВыберите удобную локацию:",
-        reply_markup=kb.kb_locations(prefix="rloc", back_target="back:category"),
+        "🏟 <b>Аренда корта</b>\n\nВыберите комплекс:",
+        reply_markup=kb.kb_rental_complexes(get_rental_complexes(), back_target="back:category"),
     )
     await call.answer()
 
 
-@router.callback_query(Flow.rental_duration, F.data.startswith("dur:"))
-async def on_rental_duration(call: CallbackQuery, state: FSMContext):
-    duration = call.data.split(":", 1)[1]
-    await state.update_data(rental_duration=duration)
-    await start_contact_step(call, state)
+@router.callback_query(Flow.rental_court, F.data.startswith("rcourt:"))
+async def on_rental_court(call: CallbackQuery, state: FSMContext):
+    court_key = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    complex_key = data["rental_complex"]
+    complex_name = TENNIS_RENTAL_COMPLEXES[complex_key]["name"]
+    court_name = dict(get_rental_courts(complex_key)).get(court_key, court_key)
+    # Название корта "встраивается" прямо в location — так разные корты
+    # одного комплекса не мешают друг другу при проверке занятости слотов.
+    await state.update_data(
+        rental_location=f"{complex_name} — {court_name}",
+        rental_court_key=court_key,
+        equipment_keys=[],
+    )
+    equipment_list = get_rental_equipment(complex_key)
+    await state.set_state(Flow.rental_equipment)
+    await call.message.edit_text(
+        EQUIPMENT_PROMPT_TEXT,
+        reply_markup=kb.kb_equipment(equipment_list, set(), back_target="back:rental_court"),
+    )
     await call.answer()
 
 
-@router.callback_query(F.data == "back:rental_duration")
-async def back_to_rental_duration(call: CallbackQuery, state: FSMContext):
-    await state.set_state(Flow.rental_duration)
+@router.callback_query(F.data == "back:rental_court")
+async def back_to_rental_court(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    complex_key = data["rental_complex"]
+    await state.set_state(Flow.rental_court)
     await call.message.edit_text(
-        "На какое время хотите арендовать корт?",
-        reply_markup=kb.kb_rental_duration(),
+        build_rental_complex_info_text(complex_key),
+        reply_markup=kb.kb_courts(get_rental_courts(complex_key), prefix="rcourt", back_target="back:rental_location"),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.rental_equipment, F.data.startswith("equip:"))
+async def on_rental_equipment_toggle(call: CallbackQuery, state: FSMContext):
+    key = call.data.split(":", 1)[1]
+    data = await state.get_data()
+    equipment_list = get_rental_equipment(data["rental_complex"])
+
+    if key == "done":
+        await start_contact_step(call, state)
+        await call.answer()
+        return
+
+    selected = set(data.get("equipment_keys", []))
+    if key in selected:
+        selected.discard(key)
+    else:
+        selected.add(key)
+    await state.update_data(equipment_keys=list(selected))
+    await call.message.edit_text(
+        EQUIPMENT_PROMPT_TEXT,
+        reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:rental_court"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:rental_equipment")
+async def back_to_rental_equipment(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    equipment_list = get_rental_equipment(data["rental_complex"])
+    selected = set(data.get("equipment_keys", []))
+    await state.set_state(Flow.rental_equipment)
+    await call.message.edit_text(
+        EQUIPMENT_PROMPT_TEXT,
+        reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:rental_court"),
     )
     await call.answer()
 
@@ -721,37 +841,212 @@ async def on_rental_date(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "back:rental_date")
 async def back_to_rental_date(call: CallbackQuery, state: FSMContext):
-    await show_rental_date_step(call, state, back_target="back:rental_duration")
+    await show_rental_date_step(call, state, back_target="back:rental_equipment")
     await call.answer()
 
 
 async def show_rental_time_step(call: CallbackQuery, state: FSMContext, selected_date):
     data = await state.get_data()
-    duration_minutes = int(data["rental_duration"])
-    booked = await get_booked_times(data["rental_location"], selected_date, sport=data.get("sport", "tennis"))
-    all_slots = get_rental_time_slots_for_date(duration_minutes, selected_date)
+    complex_key = data["rental_complex"]
+    court_key = data["rental_court_key"]
+
+    booked = await get_booked_times(data["rental_location"], selected_date, sport="tennis")
+    all_slots = get_tennis_rental_hours(complex_key, selected_date)
     free_slots = [t for t in all_slots if t not in booked]
 
     if not free_slots:
         await call.message.edit_text(
-            f"На {format_date_label(selected_date)} свободных слотов такой длительности не осталось. "
+            f"На {format_date_label(selected_date)} свободных слотов не осталось. "
             f"Пожалуйста, выберите другую дату.",
             reply_markup=kb.kb_times([], prefix="rtime", back_target="back:rental_date"),
         )
         return
 
+    prices = {t: get_tennis_rental_price(complex_key, court_key, selected_date, t) for t in free_slots}
     await call.message.edit_text(
         f"Выберите время на {format_date_label(selected_date)}:",
-        reply_markup=kb.kb_times(free_slots, prefix="rtime", back_target="back:rental_date"),
+        reply_markup=kb.kb_bp_times(free_slots, prices, prefix="rtime", back_target="back:rental_date"),
     )
 
 
 @router.callback_query(Flow.rental_time, F.data.startswith("rtime:"))
 async def on_rental_time(call: CallbackQuery, state: FSMContext):
     time_str = call.data.split(":", 1)[1]
-    await state.update_data(booking_time=time_str)
+    data = await state.get_data()
+    complex_key = data["rental_complex"]
+    court_key = data["rental_court_key"]
+    selected_date = dt.date.fromisoformat(data["booking_date"])
+
+    court_price = get_tennis_rental_price(complex_key, court_key, selected_date, time_str)
+    equipment_keys = data.get("equipment_keys", [])
+    equipment_list = get_rental_equipment(complex_key)
+    chosen_equipment = [(label, price) for key, label, price in equipment_list if key in equipment_keys]
+    equipment_total = sum(price for _, price in chosen_equipment)
+    total_price = court_price + equipment_total
+
+    label_parts = [f"Аренда корта (1 час) — {court_price} ₽"] + [
+        f"{label} — {price} ₽" for label, price in chosen_equipment
+    ]
+    package_label = "; ".join(label_parts)
+
+    await state.update_data(
+        booking_time=time_str,
+        package_key="court_rental",
+        package_label=package_label,
+        package_price=total_price,
+    )
     await state.set_state(Flow.payment)
     await send_summary_and_payment(call, state, back_target="back:rental_date")
+    await call.answer()
+
+
+# ---------------------------------------------------------------------------
+# Пиклбол — занятия (групповые/персональные), отдельно от аренды корта.
+# Сценарий полностью зеркалит теннисные школы: категория (детская/взрослая
+# школа/аренда корта) -> тип занятий (групповые/персональные) -> подтип для
+# персональных (индивидуальные/сплит) -> уровень (начинающий/опытный) ->
+# локация -> тариф -> контакт/имя/согласие -> дата/время -> оплата.
+# Реиспользует общие Flow.package / Flow.date / Flow.time и функции
+# show_package_step / show_date_step / start_contact_step — как у школ
+# тенниса, только прайс-листы и расписание свои (см. data.py).
+# Флаг data["pb_mode"]=="lesson" отличает этот путь от аренды корта.
+# ---------------------------------------------------------------------------
+@router.callback_query(Flow.pb_category, F.data.startswith("cat:"))
+async def on_pb_category(call: CallbackQuery, state: FSMContext):
+    category = call.data.split(":", 1)[1]
+
+    if category == "rent":
+        locations = get_bp_locations("pickleball")
+        await state.set_state(Flow.bp_location)
+        await call.message.edit_text(
+            f"{SPORT_LABELS['pickleball']} — аренда корта\n\nВыберите локацию:",
+            reply_markup=kb.kb_locations(locations=locations, prefix="bploc", back_target="back:pb_category"),
+        )
+    else:
+        await state.update_data(category=category)
+        await state.set_state(Flow.pb_lesson_type)
+        label = CATEGORY_LABELS[category]
+        await call.message.edit_text(
+            f"{label}\n\nВыберите формат занятий:",
+            reply_markup=kb.kb_options(LESSON_TYPE_LABELS, prefix="pbltype", back_target="back:pb_category"),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:pb_category")
+async def back_to_pb_category(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.pb_category)
+    await call.message.edit_text(
+        f"{SPORT_LABELS['pickleball']}\n\nВыберите, что вас интересует:",
+        reply_markup=kb.kb_category(back_target="back:sport"),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.pb_lesson_type, F.data.startswith("pbltype:"))
+async def on_pb_lesson_type(call: CallbackQuery, state: FSMContext):
+    lesson_type = call.data.split(":", 1)[1]
+    await state.update_data(lesson_type=lesson_type)
+
+    if lesson_type == "personal":
+        await state.set_state(Flow.pb_personal_subtype)
+        await call.message.edit_text(
+            "Выберите формат персональных занятий:",
+            reply_markup=kb.kb_options(PICKLEBALL_PERSONAL_SUBTYPES, prefix="pbstype", back_target="back:pb_lesson_type"),
+        )
+    else:
+        await state.set_state(Flow.pb_level)
+        await call.message.edit_text(
+            "Подскажите ваш уровень подготовки — так мы сразу подберём подходящую группу:",
+            reply_markup=kb.kb_level(back_target="back:pb_lesson_type"),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:pb_lesson_type")
+async def back_to_pb_lesson_type(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    label = CATEGORY_LABELS.get(data.get("category"), "")
+    await state.set_state(Flow.pb_lesson_type)
+    await call.message.edit_text(
+        f"{label}\n\nВыберите формат занятий:",
+        reply_markup=kb.kb_options(LESSON_TYPE_LABELS, prefix="pbltype", back_target="back:pb_category"),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.pb_personal_subtype, F.data.startswith("pbstype:"))
+async def on_pb_personal_subtype(call: CallbackQuery, state: FSMContext):
+    subtype = call.data.split(":", 1)[1]
+    await state.update_data(subtype=subtype)
+    await state.set_state(Flow.pb_level)
+    await call.message.edit_text(
+        "Подскажите ваш уровень подготовки — тренер адаптирует программу под вас:",
+        reply_markup=kb.kb_level(back_target="back:pb_personal_subtype"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:pb_personal_subtype")
+async def back_to_pb_personal_subtype(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.pb_personal_subtype)
+    await call.message.edit_text(
+        "Выберите формат персональных занятий:",
+        reply_markup=kb.kb_options(PICKLEBALL_PERSONAL_SUBTYPES, prefix="pbstype", back_target="back:pb_lesson_type"),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.pb_level, F.data.startswith("level:"))
+async def on_pb_level(call: CallbackQuery, state: FSMContext):
+    level = call.data.split(":", 1)[1]
+    await state.update_data(level=level)
+    await state.set_state(Flow.pb_lesson_location)
+    await call.message.edit_text(
+        "Отлично! Теперь выберите удобную локацию:",
+        reply_markup=kb.kb_locations(
+            locations=get_bp_locations("pickleball"), prefix="pblloc", back_target="back:pb_level",
+        ),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:pb_level")
+async def back_to_pb_level(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    back_target = "back:pb_personal_subtype" if data.get("lesson_type") == "personal" else "back:pb_lesson_type"
+    await state.set_state(Flow.pb_level)
+    await call.message.edit_text(
+        "Подскажите ваш уровень подготовки:",
+        reply_markup=kb.kb_level(back_target=back_target),
+    )
+    await call.answer()
+
+
+@router.callback_query(Flow.pb_lesson_location, F.data.startswith("pblloc:"))
+async def on_pb_lesson_location(call: CallbackQuery, state: FSMContext):
+    idx = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+    locations = get_bp_locations("pickleball")
+    location = locations[idx]
+    await state.update_data(location=location, pb_mode="lesson")
+
+    packages = get_pickleball_lesson_packages(data["lesson_type"], data.get("subtype"))
+    sched = get_pickleball_lesson_schedule(data["category"])
+    await store_schedule(state, sched)
+    info_text = build_pickleball_lesson_schedule_text(data["lesson_type"], data["category"])
+
+    await show_package_step(call, state, packages, info_text=info_text, back_target="back:pb_lesson_location")
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:pb_lesson_location")
+async def back_to_pb_lesson_location(call: CallbackQuery, state: FSMContext):
+    await state.set_state(Flow.pb_lesson_location)
+    await call.message.edit_text(
+        "Выберите удобную локацию:",
+        reply_markup=kb.kb_locations(locations=get_bp_locations("pickleball"), prefix="pblloc", back_target="back:pb_level"),
+    )
     await call.answer()
 
 
@@ -766,11 +1061,32 @@ EQUIPMENT_PROMPT_TEXT = "Нужен ли инвентарь? Отметьте н
 async def on_bp_location(call: CallbackQuery, state: FSMContext):
     idx = int(call.data.split(":", 1)[1])
     data = await state.get_data()
-    locations = get_bp_locations(data["sport"])
+    sport = data["sport"]
+    locations = get_bp_locations(sport)
     location = locations[idx]
-    await state.update_data(bp_location=location, equipment_keys=[])
 
-    equipment_list = get_equipment_list(data["sport"])
+    if is_pickleball_location_coming_soon(location):
+        await call.message.edit_text(
+            build_pickleball_coming_soon_text(location),
+            reply_markup=kb.kb_options({}, prefix="noop", back_target="back:bp_location"),
+        )
+        await call.answer()
+        return
+
+    await state.update_data(bp_location=location)
+
+    if sport == "badminton":
+        # У бадминтона после локации идёт выбор конкретного корта (их 2).
+        await state.set_state(Flow.bp_court)
+        await call.message.edit_text(
+            build_badminton_info_text(),
+            reply_markup=kb.kb_courts(BADMINTON_COURTS, prefix="bpcourt", back_target="back:bp_location"),
+        )
+        await call.answer()
+        return
+
+    await state.update_data(equipment_keys=[])
+    equipment_list = get_equipment_list(sport)
     await state.set_state(Flow.equipment)
     await call.message.edit_text(
         EQUIPMENT_PROMPT_TEXT,
@@ -792,11 +1108,42 @@ async def back_to_bp_location(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.callback_query(Flow.bp_court, F.data.startswith("bpcourt:"))
+async def on_bp_court(call: CallbackQuery, state: FSMContext):
+    court_key = call.data.split(":", 1)[1]
+    court_name = dict(BADMINTON_COURTS).get(court_key, court_key)
+    data = await state.get_data()
+    # Название корта встраивается прямо в bp_location — так корты не путаются
+    # друг с другом при проверке занятости слотов (аналогично аренде тенниса).
+    full_location = f"{data['bp_location']} — {court_name}"
+    await state.update_data(bp_location=full_location, equipment_keys=[])
+
+    equipment_list = get_equipment_list(data["sport"])
+    await state.set_state(Flow.equipment)
+    await call.message.edit_text(
+        EQUIPMENT_PROMPT_TEXT,
+        reply_markup=kb.kb_equipment(equipment_list, set(), back_target="back:bp_court"),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "back:bp_court")
+async def back_to_bp_court(call: CallbackQuery, state: FSMContext):
+    await state.update_data(bp_location=BADMINTON_LOCATION_NAME)
+    await state.set_state(Flow.bp_court)
+    await call.message.edit_text(
+        build_badminton_info_text(),
+        reply_markup=kb.kb_courts(BADMINTON_COURTS, prefix="bpcourt", back_target="back:bp_location"),
+    )
+    await call.answer()
+
+
 @router.callback_query(Flow.equipment, F.data.startswith("equip:"))
 async def on_equipment_toggle(call: CallbackQuery, state: FSMContext):
     key = call.data.split(":", 1)[1]
     data = await state.get_data()
-    equipment_list = get_equipment_list(data["sport"])
+    sport = data["sport"]
+    equipment_list = get_equipment_list(sport)
 
     if key == "done":
         await start_contact_step(call, state)
@@ -811,7 +1158,7 @@ async def on_equipment_toggle(call: CallbackQuery, state: FSMContext):
     await state.update_data(equipment_keys=list(selected))
     await call.message.edit_text(
         EQUIPMENT_PROMPT_TEXT,
-        reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:bp_location"),
+        reply_markup=kb.kb_equipment(equipment_list, selected, back_target=_equipment_back_target(sport)),
     )
     await call.answer()
 
@@ -819,12 +1166,13 @@ async def on_equipment_toggle(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back:equipment")
 async def back_to_equipment(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    equipment_list = get_equipment_list(data["sport"])
+    sport = data["sport"]
+    equipment_list = get_equipment_list(sport)
     selected = set(data.get("equipment_keys", []))
     await state.set_state(Flow.equipment)
     await call.message.edit_text(
         EQUIPMENT_PROMPT_TEXT,
-        reply_markup=kb.kb_equipment(equipment_list, selected, back_target="back:bp_location"),
+        reply_markup=kb.kb_equipment(equipment_list, selected, back_target=_equipment_back_target(sport)),
     )
     await call.answer()
 

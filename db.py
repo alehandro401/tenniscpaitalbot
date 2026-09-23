@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 
 from config import DATABASE_URL
 from models import Base, Client, Order
-from data import RENTAL_PRICE_PER_SLOT
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
@@ -58,11 +57,12 @@ async def create_order(client_id: int, order_id: str, data: dict) -> Order:
     `data` — это тот же словарь, что накапливается в FSMContext по ходу диалога.
     """
     sport = data.get("sport", "tennis")
-    category = data.get("category") or sport  # для badminton/pickleball category не задаётся отдельно
+    category = data.get("category") or sport  # для badminton/pickleball-аренды category не задаётся отдельно
 
+    # Цена теперь всегда приходит уже готовой в package_price — как для школ
+    # тенниса (тариф), так и для любой аренды корта (теннис/бадминтон/
+    # пиклбол, единый механизм с ценой за конкретный час/слот).
     price = data.get("package_price")
-    if category == "rent" and price is None:
-        price = RENTAL_PRICE_PER_SLOT.get(data.get("rental_duration"))
 
     booking_date_str = data.get("booking_date")  # ISO-строка "YYYY-MM-DD" из FSM
     booking_date = date.fromisoformat(booking_date_str) if booking_date_str else None

@@ -58,7 +58,7 @@ LOCATIONS = [
     "Войковская",
     "Балтийская",
     "Водный стадион",
-    "Шоссе Энтузиастов",
+    "Шоссе Энтузиастов (Скоро открытие!)",
     "Авиамоторная",
     "Воробьёвы горы",
     "Спортивная",
@@ -80,13 +80,48 @@ SPORT_LABELS = {
     "pickleball": "🏓 Пиклбол",
 }
 
-BADMINTON_LOCATIONS = ["Савеловская", "Дмитровская"]
-PICKLEBALL_LOCATIONS = ["Савеловская", "Дмитровская", "Марьина Роща"]
+BADMINTON_LOCATION_NAME = "Савеловская / Дмитровская"
+BADMINTON_ADDRESS = "Москва, ул. Складочная, дом 1, стр. 1"
+BADMINTON_COURTS = [
+    ("court1", "Корт 1 — Hard"),
+    ("court2", "Корт 2 — Hard"),
+]
+
+PICKLEBALL_LOCATIONS = ["Савеловская", "Дмитровская", "Марьина Роща", "Шоссе Энтузиастов (Скоро открытие!)", "Авиамоторная"]
+
+# Площадки пиклбола на Шоссе Энтузиастов/Авиамоторной физически ещё не
+# открыты (тот же комплекс, что и у тенниса — см. TENNIS_RENTAL_COMPLEXES
+# ["shosse_entuziastov"]["coming_soon"]). Бронирование для них показывает
+# информационное сообщение вместо перехода к инвентарю/дате/времени.
+PICKLEBALL_COMING_SOON_LOCATIONS = {"Шоссе Энтузиастов (Скоро открытие!)", "Авиамоторная"}
+
+
+def is_pickleball_location_coming_soon(location: str) -> bool:
+    return location in PICKLEBALL_COMING_SOON_LOCATIONS
+
+
+def build_pickleball_coming_soon_text(location: str) -> str:
+    return (
+        f"📍 {location}\n\n"
+        f"🚧 СКОРО ОТКРЫТИЕ! Бронирование через бота пока недоступно. "
+    )
 
 
 def get_bp_locations(sport: str) -> list[str]:
-    """Локации для бадминтона/пиклбола (не пересекаются со списком LOCATIONS тенниса)."""
-    return {"badminton": BADMINTON_LOCATIONS, "pickleball": PICKLEBALL_LOCATIONS}.get(sport, [])
+    """Локации для бадминтона (одно здание — один пункт списком) и пиклбола."""
+    return {"badminton": [BADMINTON_LOCATION_NAME], "pickleball": PICKLEBALL_LOCATIONS}.get(sport, [])
+
+
+def build_badminton_info_text() -> str:
+    lines = [
+        f"📍 {BADMINTON_LOCATION_NAME}",
+        BADMINTON_ADDRESS,
+        "",
+        "Время работы: пн-вс 06:00 — 24:00",
+        "",
+        "Выберите корт:",
+    ]
+    return "\n".join(lines)
 
 
 # Инвентарь: (ключ, подпись, цена за аренду)
@@ -128,7 +163,242 @@ def get_court_price(sport: str, is_weekend: bool, time_str: str) -> int:
         return 3000  # флэт-цена, будни и выходные одинаково
     if sport == "pickleball":
         return get_pickleball_hour_price(is_weekend, time_str)
-    return 0  # для тенниса цена считается по-другому (RENTAL_PRICE_PER_SLOT)
+    return 0  # для тенниса цена считается отдельно, см. get_tennis_rental_price
+
+
+# ---------------------------------------------------------------------------
+# Пиклбол: групповые и персональные занятия (отдельно от аренды корта).
+# Сценарий полностью зеркалит теннисные школы: категория (детская/взрослая/
+# аренда) -> тип занятий -> [подтип для персональных] -> уровень -> локация
+# -> тариф -> ... Расписание совпадает со «стандартной» теннисной группой —
+# используются те же константы _STANDARD_ADULT_SCHEDULE/_STANDARD_KIDS_SCHEDULE,
+# определённые ниже в разделе районов тенниса. Категория (kids/adults/rent)
+# и тип занятий (group/personal) переиспользуют CATEGORY_LABELS/
+# LESSON_TYPE_LABELS тенниса — формулировки идентичны.
+# ---------------------------------------------------------------------------
+PICKLEBALL_PERSONAL_SUBTYPES = {
+    "individual": "1️⃣ Индивидуальные занятия",
+    "split": "👥 Сплит (2 ученика + тренер)",
+}
+
+PICKLEBALL_GROUP_PACKAGES = [
+    ("trial", "1 Пробное занятие", 1999),
+    ("trial_combo", "Пробное занятие теннисом + Пробное занятие по Пиклболу", 2999),
+    ("single", "Разовое занятие", 2500),
+    ("sub4", "Абонемент на 4 занятия", 7500),
+    ("sub8", "Абонемент на 8 занятий (2 раза в неделю)", 14000),
+]
+
+PICKLEBALL_PERSONAL_PACKAGES = {
+    "individual": [
+        ("trial", "Пробное индивид. занятие", 6500),
+        ("single", "Разовое занятие", 8000),
+        ("sub4", "Абонемент на 4 индивид. занятия", 26000),
+    ],
+    "split": [
+        ("trial", "Пробная сплит-тренировка", 7500),
+        ("single", "Разовая сплит-тренировка", 9000),
+        ("sub4", "Абонемент на 4 сплит-тренировки", 30000),
+    ],
+}
+
+
+def get_pickleball_lesson_packages(lesson_type: str, subtype: str | None = None) -> list[tuple[str, str, int]]:
+    if lesson_type == "group":
+        return PICKLEBALL_GROUP_PACKAGES
+    return PICKLEBALL_PERSONAL_PACKAGES.get(subtype, [])
+
+
+def get_pickleball_lesson_schedule(category: str) -> dict:
+    """Расписание пиклбол-занятий — те же часы, что и у стандартной теннисной группы."""
+    return _STANDARD_ADULT_SCHEDULE if category == "adults" else _STANDARD_KIDS_SCHEDULE
+
+
+_PICKLEBALL_RECS = {
+    ("group", "beginner"): (
+        "Рекомендуем группу для начинающих — акцент на технику ударов и "
+        "базовые правила игры, комфортный темп."
+    ),
+    ("group", "experienced"): (
+        "Рекомендуем группу для опытных игроков — больше игровой практики "
+        "и тактики."
+    ),
+    ("personal", "beginner"): (
+        "Тренер выстроит программу с нуля: постановка хватки, базовой "
+        "техники ударов и перемещений по корту."
+    ),
+    ("personal", "experienced"): (
+        "Тренер сделает акцент на разбор технических деталей и тактику игры."
+    ),
+}
+
+
+def get_pickleball_recommendation(lesson_type: str, level: str) -> str:
+    return _PICKLEBALL_RECS.get(
+        (lesson_type, level),
+        "Тренер подберёт подходящую программу индивидуально на пробном занятии.",
+    )
+
+
+def build_pickleball_lesson_schedule_text(lesson_type: str, category: str) -> str:
+    sched = get_pickleball_lesson_schedule(category)
+    title = "Групповые занятия" if lesson_type == "group" else "Персональные и сплит-тренировки"
+    age_ru = "взрослые" if category == "adults" else "дети"
+    age_word = "взрослых" if category == "adults" else "детских"
+    lines = [
+        f"{title} ({age_ru})",
+        "",
+        f"Расписание {age_word} групп:",
+        f"пн–пт {sched['weekday'][0]} — {sched['weekday'][1]}",
+        f"сб, вс {sched['weekend'][0]} — {sched['weekend'][1]}",
+    ]
+    if lesson_type == "group":
+        lines.append("До 6 человек в группе.")
+    lines += ["", "Выберите подходящий вариант занятий:"]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Аренда теннисных кортов — три комплекса. Внутри комплекса у каждого корта
+# (или тарифа) — своя цена и своё расписание доступности, которые могут
+# отличаться по дням недели и по времени суток. Выбор конкретного корта
+# "встраивается" прямо в location (например, "Войковская / Балтийская / ...
+# — Открытый корт «Грунт»"), поэтому get_booked_times() автоматически не
+# путает разные корты одного комплекса между собой — без изменений в БД.
+# ---------------------------------------------------------------------------
+TENNIS_RENTAL_EQUIPMENT = [
+    ("balls_basket", "Аренда корзины теннисных мячей", 600),
+    ("racket", "Аренда ракетки для тенниса", 500),
+]
+
+# Войковская: часы работы зависят от конкретного дня недели (не просто
+# будни/выходные), одинаковые для обоих тарифов этого комплекса.
+_VOIKOVSKAYA_HOURS_BY_WEEKDAY = {
+    0: ("18:00", "22:00"),  # понедельник
+    1: ("18:00", "22:00"),  # вторник
+    2: ("18:00", "22:00"),  # среда
+    3: ("18:00", "22:00"),  # четверг
+    4: ("18:00", "21:00"),  # пятница
+    5: ("14:00", "18:00"),  # суббота
+    6: ("10:00", "17:00"),  # воскресенье
+}
+
+
+def _savelovskaya_regular_price(is_weekend: bool, hour: int) -> int:
+    """Базовая цена «обычного» закрытого корта (Hard) на Савеловской по часам."""
+    if is_weekend:
+        if 6 <= hour < 8:
+            return 5000
+        if 8 <= hour < 20:
+            return 6000
+        return 5000  # 20:00–24:00
+    if 6 <= hour < 8:
+        return 4300
+    if 8 <= hour < 12:
+        return 6000
+    if 12 <= hour < 15:
+        return 4300
+    if 15 <= hour < 23:
+        return 6500
+    return 4300  # 23:00 (последний слот)
+
+
+TENNIS_RENTAL_COMPLEXES = {
+    "voikovskaya": {
+        "name": "Войковская / Балтийская / Водный стадион",
+        "address": "Москва, Ленинградское ш., 25А, стр. 2",
+        "hours_note": "Часы работы зависят от дня недели — уточняются на шаге выбора времени.",
+        "extra_note": (
+            "☔️ В случае дождя: тариф «Открытый корт» — перенос на новое время; "
+            "тариф «с поддержкой зала» — переход на крытый корт."
+        ),
+        "courts": [
+            ("grunt", "Открытый корт «Грунт»"),
+            ("grunt_hall", "Корт «Грунт» с поддержкой зала (при дожде — крытый корт)"),
+        ],
+        "equipment": TENNIS_RENTAL_EQUIPMENT,
+    },
+    "savelovskaya": {
+        "name": "Савеловская / Дмитровская / Марьина Роща",
+        "address": "Москва, ул. Складочная, дом 1, стр. 1",
+        "hours_note": "Время работы: ежедневно 06:00 — 24:00.",
+        "courts": [
+            ("court1", "Корт 1 — Hard (закрытый)"),
+            ("court2", "Корт 2 — Hard (закрытый)"),
+            ("mini", "Мини-корт (тренировочный, дешевле)"),
+        ],
+        "equipment": TENNIS_RENTAL_EQUIPMENT,
+    },
+    "shosse_entuziastov": {
+        "name": "Шоссе Энтузиастов (Скоро открытие!)/ Авиамоторная",
+        "address": "Москва, шоссе Энтузиастов, дом 31, стр. 3",
+        "coming_soon": True,
+        "amenities": "6 кортов с покрытием Hard + 4 площадки для пиклбола.",
+    },
+}
+
+
+def get_rental_complexes() -> list[tuple[str, str]]:
+    """Список (ключ, название) всех комплексов аренды тенниса."""
+    return [(key, info["name"]) for key, info in TENNIS_RENTAL_COMPLEXES.items()]
+
+
+def get_rental_courts(complex_key: str) -> list[tuple[str, str]]:
+    return TENNIS_RENTAL_COMPLEXES.get(complex_key, {}).get("courts", [])
+
+
+def get_rental_equipment(complex_key: str) -> list[tuple[str, str, int]]:
+    return TENNIS_RENTAL_COMPLEXES.get(complex_key, {}).get("equipment", [])
+
+
+def is_rental_complex_coming_soon(complex_key: str) -> bool:
+    return bool(TENNIS_RENTAL_COMPLEXES.get(complex_key, {}).get("coming_soon"))
+
+
+def build_rental_complex_info_text(complex_key: str) -> str:
+    c = TENNIS_RENTAL_COMPLEXES[complex_key]
+    lines = [f"📍 {c['name']}", c["address"], ""]
+
+    if c.get("coming_soon"):
+        lines.append("🚧 СКОРО ОТКРЫТИЕ! Бронирование через бота пока недоступно.")
+        if c.get("amenities"):
+            lines.append("")
+            lines.append(c["amenities"])
+        return "\n".join(lines)
+
+    lines.append(c.get("hours_note", "Время работы: пн-вс 07:00 — 23:00"))
+    if c.get("amenities"):
+        lines.append("")
+        lines.append(c["amenities"])
+    if c.get("extra_note"):
+        lines.append("")
+        lines.append(c["extra_note"])
+    lines.append("")
+    lines.append("Выберите корт:")
+    return "\n".join(lines)
+
+
+def get_tennis_rental_hours(complex_key: str, date: dt.date) -> list[str]:
+    """Доступные часовые слоты для комплекса на конкретную дату."""
+    if complex_key == "voikovskaya":
+        start, end = _VOIKOVSKAYA_HOURS_BY_WEEKDAY[date.weekday()]
+        return _time_slots(start, end, step_minutes=60)
+    if complex_key == "savelovskaya":
+        return get_hour_slots()  # 06:00–24:00 ежедневно
+    return []
+
+
+def get_tennis_rental_price(complex_key: str, court_key: str, date: dt.date, time_str: str) -> int:
+    """Цена аренды конкретного корта на конкретный час."""
+    if complex_key == "voikovskaya":
+        return {"grunt": 3000, "grunt_hall": 4000}.get(court_key, 0)
+    if complex_key == "savelovskaya":
+        is_weekend = date.weekday() >= 5
+        hour = int(time_str.split(":")[0])
+        base = _savelovskaya_regular_price(is_weekend, hour)
+        return base - 1000 if court_key == "mini" else base
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # ПРИМЕЧАНИЕ: в присланных данных «Ломоносовский проспект» встречается в двух
@@ -431,8 +701,8 @@ DISTRICTS = {
         },
     },
     "shosse_entuziastov": {
-        "name": "Шоссе Энтузиастов",
-        "locations": ["Шоссе Энтузиастов", "Авиамоторная"],
+        "name": "Шоссе Энтузиастов (Скоро открытие!)",
+        "locations": ["Шоссе Энтузиастов (Скоро открытие!)", "Авиамоторная"],
         "group_offers": [
             {
                 "key": "standard",
@@ -621,21 +891,6 @@ def get_district_key(location: str) -> str | None:
         if location in info["locations"]:
             return key
     return None
-
-# ---------------------------------------------------------------------------
-# Аренда корта
-# ---------------------------------------------------------------------------
-RENTAL_DURATIONS = {
-    "60": "60 минут",
-    "90": "90 минут",
-    "120": "120 минут",
-}
-
-RENTAL_PRICE_PER_SLOT = {
-    "60": 2000,
-    "90": 2800,
-    "120": 3600,
-}
 
 # ---------------------------------------------------------------------------
 # Рекомендации по группе в зависимости от уровня
@@ -827,13 +1082,6 @@ def get_time_slots_for_window(
     return _time_slots(start, end)
 
 
-def get_rental_time_slots_for_date(duration_minutes: int, date: dt.date) -> list[str]:
-    is_weekend = date.weekday() >= 5
-    sched = PERSONAL_SCHEDULE  # для аренды используем широкое окно 07:00–23:00
-    start, end = sched["weekend" if is_weekend else "weekday"]
-    return _time_slots(start, end, step_minutes=duration_minutes)
-
-
 def generate_payment_link(order_id: str) -> str:
     """
     ЗАГЛУШКА. Возвращает ссылку вида https://pay.tenniscapital.ru/pay?order=...
@@ -887,10 +1135,33 @@ def build_summary_text(d: dict) -> str:
     lines = ["Проверьте, пожалуйста, детали записи:", ""]
 
     sport = d.get("sport", "tennis")
+    category = d.get("category")
+    pb_mode = d.get("pb_mode")
 
-    if sport in ("badminton", "pickleball"):
-        lines.append(f"Направление: {SPORT_LABELS.get(sport, sport)}")
-        lines.append(f"Локация: {d.get('bp_location')}")
+    if sport in ("badminton", "pickleball") or (sport == "tennis" and category == "rent"):
+        # Локация может лежать в разных ключах в зависимости от ветки:
+        # bp_location — аренда корта бадминтона/пиклбола, rental_location —
+        # аренда тенниса, location — занятия пиклбола (те же ключи, что у
+        # тенниса, так как этот путь переиспользует школьный флоу).
+        location = d.get("bp_location") or d.get("rental_location") or d.get("location")
+
+        if sport == "tennis":
+            lines.append("Направление: 🎾 Аренда корта (теннис)")
+        elif pb_mode == "lesson":
+            lesson_type = d.get("lesson_type")
+            lines.append(f"Направление: {SPORT_LABELS.get(sport, sport)} — {CATEGORY_LABELS.get(category, category)}")
+            lines.append(f"Тип занятий: {LESSON_TYPE_LABELS.get(lesson_type, lesson_type)}")
+            if lesson_type == "personal":
+                subtype = d.get("subtype")
+                lines.append(f"Формат: {PICKLEBALL_PERSONAL_SUBTYPES.get(subtype, subtype)}")
+            level = d.get("level")
+            lines.append(f"Уровень подготовки: {LEVEL_LABELS.get(level, level)}")
+            lines.append("")
+            lines.append(get_pickleball_recommendation(lesson_type, level))
+            lines.append("")
+        else:
+            lines.append(f"Направление: {SPORT_LABELS.get(sport, sport)}")
+        lines.append(f"Локация: {location}")
         package_label = d.get("package_label")
         package_price = d.get("package_price")
         if package_label:
@@ -898,45 +1169,36 @@ def build_summary_text(d: dict) -> str:
         if package_price:
             lines.append(f"Стоимость: {package_price} ₽")
     else:
-        category = d.get("category")
         lines.append(f"Направление: {CATEGORY_LABELS.get(category, category)}")
 
-        if category == "rent":
-            lines.append(f"Локация: {d.get('rental_location')}")
-            dur = d.get("rental_duration")
-            lines.append(f"Длительность: {RENTAL_DURATIONS.get(dur, dur)}")
-            price = RENTAL_PRICE_PER_SLOT.get(dur)
-            if price:
-                lines.append(f"Стоимость: {price} ₽")
+        lesson_type = d.get("lesson_type")
+        lines.append(f"Тип занятий: {LESSON_TYPE_LABELS.get(lesson_type, lesson_type)}")
+
+        subtype = d.get("subtype")
+        if lesson_type == "group":
+            lines.append(f"Формат: {GROUP_SUBTYPES.get(subtype, subtype)}")
         else:
-            lesson_type = d.get("lesson_type")
-            lines.append(f"Тип занятий: {LESSON_TYPE_LABELS.get(lesson_type, lesson_type)}")
+            lines.append(f"Формат: {PERSONAL_SUBTYPES.get(subtype, subtype)}")
 
-            subtype = d.get("subtype")
-            if lesson_type == "group":
-                lines.append(f"Формат: {GROUP_SUBTYPES.get(subtype, subtype)}")
-            else:
-                lines.append(f"Формат: {PERSONAL_SUBTYPES.get(subtype, subtype)}")
+        level = d.get("level")
+        lines.append(f"Уровень подготовки: {LEVEL_LABELS.get(level, level)}")
 
-            level = d.get("level")
-            lines.append(f"Уровень подготовки: {LEVEL_LABELS.get(level, level)}")
-
-            if lesson_type == "group":
-                lines.append("")
-                lines.append(get_group_recommendation(subtype, level))
-            else:
-                lines.append("")
-                lines.append(get_personal_recommendation(level))
-
+        if lesson_type == "group":
             lines.append("")
-            lines.append(f"Локация: {d.get('location')}")
+            lines.append(get_group_recommendation(subtype, level))
+        else:
+            lines.append("")
+            lines.append(get_personal_recommendation(level))
 
-            package_label = d.get("package_label")
-            package_price = d.get("package_price")
-            if package_label:
-                lines.append(f"Тариф: {package_label}")
-            if package_price:
-                lines.append(f"Стоимость: {package_price} ₽")
+        lines.append("")
+        lines.append(f"Локация: {d.get('location')}")
+
+        package_label = d.get("package_label")
+        package_price = d.get("package_price")
+        if package_label:
+            lines.append(f"Тариф: {package_label}")
+        if package_price:
+            lines.append(f"Стоимость: {package_price} ₽")
 
     booking_date = d.get("booking_date")
     booking_time = d.get("booking_time")
@@ -989,15 +1251,22 @@ def build_order_short_label(order) -> str:
 def build_order_detail_text(order) -> str:
     """Подробное описание заявки — для подтверждения отмены."""
     lines = [f"📍 Локация: {order.location}"]
-    if order.category in ("badminton", "pickleball"):
+    sport = getattr(order, "sport", "tennis")
+
+    if sport == "pickleball" and order.category in ("adults", "kids"):
+        # Занятия пиклбола (не аренда корта) — у них category="adults"/"kids",
+        # как у теннисных школ, поэтому здесь сначала проверяем именно sport.
+        lines.append(f"Направление: {SPORT_LABELS.get(sport, sport)} — занятия")
+        if order.package_label:
+            lines.append(f"Состав: {order.package_label}")
+    elif order.category in ("badminton", "pickleball"):
         lines.append(f"Направление: {SPORT_LABELS.get(order.category, order.category)}")
         if order.package_label:
             lines.append(f"Состав: {order.package_label}")
     elif order.category == "rent":
         lines.append("Направление: 🎾 Аренда корта (теннис)")
-        dur = RENTAL_DURATIONS.get(order.rental_duration)
-        if dur:
-            lines.append(f"Длительность: {dur}")
+        if order.package_label:
+            lines.append(f"Состав: {order.package_label}")
     else:
         lines.append(f"Направление: {CATEGORY_LABELS.get(order.category, order.category)}")
         if order.package_label:
@@ -1030,7 +1299,9 @@ def build_final_info_text(d: dict) -> str:
     """
     sport = d.get("sport", "tennis")
     if sport in ("badminton", "pickleball"):
-        location = d.get("bp_location")
+        # bp_location — аренда корта; location — занятия пиклбола (флоу
+        # переиспользует школьный сценарий тенниса и его ключ "location").
+        location = d.get("bp_location") or d.get("location")
     elif d.get("category") == "rent":
         location = d.get("rental_location")
     else:
