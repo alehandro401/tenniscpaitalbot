@@ -57,6 +57,12 @@ class Order(Base):
     rental_duration: Mapped[str | None] = mapped_column(String, nullable=True)
     package_key: Mapped[str | None] = mapped_column(String, nullable=True)
     package_label: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # provider_payment_charge_id — номер транзакции в ЮKassa, который Telegram
+    # присылает после успешной оплаты (объект SuccessfulPayment). Сам заказ
+    # ищется по order_id (он же payload инвойса), а не по этому полю — оно
+    # чисто справочное, на случай возврата или сверки с личным кабинетом ЮKassa.
+    provider_payment_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
     price: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Дата и время записи. booking_time хранится строкой "HH:MM" — так проще

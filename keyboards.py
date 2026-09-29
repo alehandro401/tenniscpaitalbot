@@ -153,7 +153,10 @@ def kb_times(times: list[str], prefix: str, back_target: str) -> InlineKeyboardM
 def kb_payment(pay_link: str, back_target: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text="💳 Оплатить", url=pay_link))
-    b.row(InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data="pay:confirm"))
+    # Используется только в тестовом режиме (когда ЮKassa не подключена) —
+    # в реальном режиме оплата идёт через встроенный Telegram Payments API
+    # (sendInvoice), и эта клавиатура вообще не задействуется, см. handlers.py.
+    b.row(InlineKeyboardButton(text="🔄 Проверить оплату", callback_data="pay:check"))
     b.row(InlineKeyboardButton(text="◀️ Назад", callback_data=back_target))
     return b.as_markup()
 

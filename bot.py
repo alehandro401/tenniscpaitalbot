@@ -1,17 +1,12 @@
 import asyncio
 import logging
 import sys
-#
-import os
-#
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-#
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-#
 from config import BOT_TOKEN
 from handlers import router
 from db import init_db

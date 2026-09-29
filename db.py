@@ -142,10 +142,10 @@ async def get_booked_times(location: str, booking_date: date, sport: str = "tenn
 
 async def mark_order_paid(order_id: str) -> None:
     """
-    Помечает заявку оплаченной. Сейчас вызывается по нажатию кнопки
-    «Я оплатил(а)» — это временное решение для теста. При подключении
-    реального эквайринга сюда же (по order_id) должен приходить вызов
-    из webhook-обработчика платёжной системы, а не из хендлера кнопки.
+    Помечает заявку оплаченной. Вызывается из обработчика SuccessfulPayment
+    (см. handlers.py) сразу после подтверждения оплаты Telegram'ом, либо
+    вручную из кнопки «Проверить оплату» — запасной вариант для тестового
+    режима без подключённой ЮKassa.
     """
     async with Session() as session:
         order = await session.scalar(select(Order).where(Order.order_id == order_id))
@@ -153,6 +153,25 @@ async def mark_order_paid(order_id: str) -> None:
             order.status = "paid"
             order.paid_at = datetime.utcnow()
             await session.commit()
+
+
+async def set_provider_payment_id(order_id: str, provider_payment_charge_id: str) -> None:
+    """
+    Сохраняет provider_payment_charge_id — номер транзакции в ЮKassa,
+    который Telegram присылает в объекте SuccessfulPayment. Пригодится,
+    если понадобится найти платёж в личном кабинете ЮKassa (например, для
+    оформления возврата).
+    """
+    async with Session() as session:
+        order = await session.scalar(select(Order).where(Order.order_id == order_id))
+        if order is not None:
+            order.provider_payment_id = provider_payment_charge_id
+            await session.commit()
+
+
+async def get_client_by_id(client_id: int) -> Client | None:
+    async with Session() as session:
+        return await session.get(Client, client_id)
 
 
 # ---------------------------------------------------------------------------

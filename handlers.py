@@ -4,7 +4,7 @@ import datetime as dt
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove, LabeledPrice, PreCheckoutQuery
 
 import keyboards as kb
 from states import Flow
@@ -34,8 +34,8 @@ from data import (
     format_date_label,
     get_time_slots_for_window,
     get_bp_locations,
-    is_pickleball_location_coming_soon,
-    build_pickleball_coming_soon_text,
+    is_location_coming_soon,
+    build_coming_soon_text,
     get_equipment_list,
     get_hour_slots,
     get_court_price,
@@ -54,6 +54,7 @@ from data import (
     get_pickleball_lesson_packages,
     get_pickleball_lesson_schedule,
     build_pickleball_lesson_schedule_text,
+    build_final_info_text_from_order,
 )
 from db import (
     get_or_create_client,
@@ -65,7 +66,10 @@ from db import (
     get_upcoming_orders,
     get_order_by_order_id,
     cancel_order,
+    set_provider_payment_id,
 )
+from payments import is_yookassa_configured
+from config import YOOKASSA_PROVIDER_TOKEN
 
 router = Router()
 log = logging.getLogger(__name__)
@@ -290,6 +294,14 @@ async def on_location(call: CallbackQuery, state: FSMContext):
     location = LOCATIONS[idx]
     await state.update_data(location=location)
     data = await state.get_data()
+
+    if is_location_coming_soon(location):
+        await call.message.edit_text(
+            build_coming_soon_text(location),
+            reply_markup=kb.kb_options({}, prefix="noop", back_target="back:location"),
+        )
+        await call.answer()
+        return
 
     if data["lesson_type"] == "personal":
         packages = get_personal_packages(location, data["subtype"])
@@ -1029,6 +1041,15 @@ async def on_pb_lesson_location(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     locations = get_bp_locations("pickleball")
     location = locations[idx]
+
+    if is_location_coming_soon(location):
+        await call.message.edit_text(
+            build_coming_soon_text(location),
+            reply_markup=kb.kb_options({}, prefix="noop", back_target="back:pb_lesson_location"),
+        )
+        await call.answer()
+        return
+
     await state.update_data(location=location, pb_mode="lesson")
 
     packages = get_pickleball_lesson_packages(data["lesson_type"], data.get("subtype"))
@@ -1065,9 +1086,9 @@ async def on_bp_location(call: CallbackQuery, state: FSMContext):
     locations = get_bp_locations(sport)
     location = locations[idx]
 
-    if is_pickleball_location_coming_soon(location):
+    if is_location_coming_soon(location):
         await call.message.edit_text(
-            build_pickleball_coming_soon_text(location),
+            build_coming_soon_text(location),
             reply_markup=kb.kb_options({}, prefix="noop", back_target="back:bp_location"),
         )
         await call.answer()
@@ -1261,7 +1282,7 @@ async def on_bp_time(call: CallbackQuery, state: FSMContext):
 
 
 # ---------------------------------------------------------------------------
-# Общий шаг: показать summary и ссылку на оплату
+# Общий шаг: показать summary и отправить счёт на оплату
 # ---------------------------------------------------------------------------
 async def send_summary_and_payment(call: CallbackQuery, state: FSMContext, back_target: str):
     data = await state.get_data()
@@ -1277,37 +1298,119 @@ async def send_summary_and_payment(call: CallbackQuery, state: FSMContext, back_
     await create_order(client_id=data["client_id"], order_id=order_id, data=data)
 
     summary = build_summary_text(data)
-    pay_link = generate_payment_link(order_id)
+    amount = int(data.get("package_price") or 0)
 
-    text = (
-        f"{summary}\n\n"
-        f"💳 Для завершения записи оплатите по ссылке ниже, "
-        f"а после оплаты нажмите «Я оплатил(а)»."
-    )
-    await call.message.edit_text(text, reply_markup=kb.kb_payment(pay_link, back_target))
+    if is_yookassa_configured() and amount > 0:
+        # Реальная оплата: счёт (инвойс) со своей кнопкой «Оплатить» откроется
+        # прямо в Telegram — Telegram сам пришлёт подтверждение оплаты, без
+        # webhook и без внешнего сайта (см. on_pre_checkout_query/on_successful_payment).
+        await call.message.edit_text(
+            f"{summary}\n\n💳 Нажмите «Оплатить» в счёте ниже — форма оплаты "
+            f"откроется прямо здесь, в Telegram. После оплаты запись "
+            f"подтвердится автоматически.",
+            reply_markup=kb.kb_options({}, prefix="noop", back_target=back_target),
+        )
+        try:
+            await call.bot.send_invoice(
+                chat_id=call.from_user.id,
+                title="Запись в TennisCapital",
+                description=(summary[:250] + "…") if len(summary) > 250 else summary,
+                payload=order_id,
+                provider_token=YOOKASSA_PROVIDER_TOKEN,
+                currency="RUB",
+                prices=[LabeledPrice(label="Оплата записи", amount=amount * 100)],  # в копейках
+            )
+        except Exception:
+            log.exception("Не удалось отправить счёт на оплату для заказа %s", order_id)
+            await call.message.answer(
+                "⚠️ Не удалось сформировать счёт на оплату. Попробуйте, "
+                "пожалуйста, ещё раз чуть позже или свяжитесь с администратором."
+            )
+    else:
+        # Тестовый режим: провайдер не подключён — старое поведение с
+        # фейковой ссылкой, чтобы бот запускался и без настроенного эквайринга.
+        pay_link = generate_payment_link(order_id)
+        text = (
+            f"{summary}\n\n💳 Для завершения записи оплатите по ссылке ниже.\n"
+            f"Тестовый режим (ЮKassa не подключена): нажмите «Проверить оплату», "
+            f"чтобы подтвердить запись."
+        )
+        await call.message.edit_text(text, reply_markup=kb.kb_payment(pay_link, back_target))
+    await call.answer()
 
 
 # ---------------------------------------------------------------------------
-# Подтверждение оплаты
+# Подтверждение оплаты через Telegram Payments API (реальный путь)
 # ---------------------------------------------------------------------------
-@router.callback_query(Flow.payment, F.data == "pay:confirm")
-async def on_payment_confirm(call: CallbackQuery, state: FSMContext):
+@router.pre_checkout_query()
+async def on_pre_checkout_query(pre_checkout_query: PreCheckoutQuery):
+    """
+    Telegram спрашивает подтверждение прямо перед списанием денег — нужно
+    ответить в течение 10 секунд. Здесь проверяем, что заказ ещё существует
+    и не отменён (например, клиент мог успеть его отменить командой /cancel,
+    пока держал открытым счёт).
+    """
+    order = await get_order_by_order_id(pre_checkout_query.invoice_payload)
+    if order is None or order.status == "cancelled":
+        await pre_checkout_query.answer(
+            ok=False,
+            error_message="Эта запись больше недоступна. Пожалуйста, начните заново через /start.",
+        )
+        return
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def on_successful_payment(message: Message, state: FSMContext):
+    """
+    Приходит от Telegram сразу после реального списания денег — это и есть
+    настоящее подтверждение оплаты (в отличие от старой кнопки «Я оплатил(а)»,
+    которая верила клиенту на слово).
+    """
+    payment = message.successful_payment
+    order_id = payment.invoice_payload
+
+    order = await get_order_by_order_id(order_id)
+    if order is None:
+        log.warning("SuccessfulPayment для неизвестного заказа %s", order_id)
+        return
+
+    if order.status != "paid":
+        await mark_order_paid(order_id)
+        await set_provider_payment_id(order_id, payment.provider_payment_charge_id)
+        order = await get_order_by_order_id(order_id)
+        log.info("Новая запись оплачена через Telegram Payments: %s", order_id)
+
+    await message.answer(build_final_info_text_from_order(order))
+    await state.clear()
+
+
+# ---------------------------------------------------------------------------
+# Проверка оплаты — только для тестового режима без подключённой ЮKassa
+# (в реальном режиме подтверждение приходит автоматически, см. выше)
+# ---------------------------------------------------------------------------
+@router.callback_query(Flow.payment, F.data == "pay:check")
+async def on_payment_check(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    order_id = data.get("order_id")
+    order = await get_order_by_order_id(order_id) if order_id else None
 
-    # ЗАГЛУШКА: реальная проверка оплаты должна идти через webhook платёжной
-    # системы, а не по нажатию кнопки пользователем. Здесь для демонстрации
-    # мы считаем оплату подтверждённой сразу после нажатия.
-    await mark_order_paid(data["order_id"])
+    if order is None:
+        await call.answer("Заявка не найдена — начните запись заново через /start.", show_alert=True)
+        return
 
-    final_text = build_final_info_text(data)
-    await call.message.edit_text(final_text)
-    await call.answer("Оплата подтверждена ✅")
+    if order.status == "paid":
+        await call.message.edit_text(build_final_info_text_from_order(order))
+        await call.answer("Оплата подтверждена ✅")
+        await state.clear()
+        return
 
-    log.info("Новая запись оформлена: %s", data)
-    # Здесь можно отправить уведомление администраторам клуба, например:
-    # for admin_id in ADMIN_IDS:
-    #     await call.bot.send_message(admin_id, f"Новая запись:\n{build_summary_text(data)}")
-
+    # Эта кнопка вообще показывается только в тестовом режиме (см.
+    # send_summary_and_payment) — здесь всегда подтверждаем "на слово".
+    await mark_order_paid(order_id)
+    await call.message.edit_text(build_final_info_text(data))
+    await call.answer("Оплата подтверждена (тестовый режим) ✅")
+    log.info("Новая запись оформлена (тестовый режим): %s", data)
     await state.clear()
 
 
